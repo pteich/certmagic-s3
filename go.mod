@@ -1,4 +1,4 @@
-module github.com/techknowlogick/certmagic-s3
+module github.com/pteich/certmagic-s3
 
 go 1.24
 
