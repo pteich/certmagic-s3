@@ -13,7 +13,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
-	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"go.uber.org/zap"
 )
@@ -89,31 +89,55 @@ func (s3 *S3) Lock(ctx context.Context, key string) error {
 	s3.Logger.Info(fmt.Sprintf("Lock: %v", s3.objName(key)))
 	var startedAt = time.Now()
 
+	data, err := s3.getLockFile(ctx, key)
+	if err == nil {
+		lt, err := time.Parse(time.RFC3339, data)
+		if err == nil && lt.Add(LockTimeout).After(time.Now()) {
+			return fmt.Errorf("lock already exists and is still valid")
+		}
+	}
+
 	for {
-		obj, err := s3.Client.GetObject(ctx, s3.Bucket, s3.objLockName(key), minio.GetObjectOptions{})
+		err = s3.putLockFile(ctx, key)
 		if err == nil {
+			return nil
+		}
+
+		lt, err := time.Parse(time.RFC3339, data)
+		if err != nil {
 			return s3.putLockFile(ctx, key)
 		}
-		buf, err := io.ReadAll(obj)
-		if err != nil {
-			// Retry
-			continue
-		}
-		lt, err := time.Parse(time.RFC3339, string(buf))
-		if err != nil {
-			// Lock file does not make sense, overwrite.
-			return s3.putLockFile(ctx, key)
-		}
+
 		if lt.Add(LockTimeout).Before(time.Now()) {
-			// Existing lock file expired, overwrite.
 			return s3.putLockFile(ctx, key)
 		}
 
 		if startedAt.Add(LockTimeout).Before(time.Now()) {
-			return errors.New("acquiring lock failed")
+			return fmt.Errorf("timeout while acquiring lock")
 		}
-		time.Sleep(LockPollInterval)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(LockPollInterval):
+			continue
+		}
 	}
+}
+
+func (s3 *S3) getLockFile(ctx context.Context, key string) (string, error) {
+	obj, err := s3.Client.GetObject(ctx, s3.Bucket, s3.objLockName(key), minio.GetObjectOptions{})
+	if err != nil {
+		return "", err
+	}
+
+	defer obj.Close()
+	buf, err := io.ReadAll(obj)
+	if err != nil {
+		return "", err
+	}
+
+	return string(buf), nil
 }
 
 func (s3 *S3) putLockFile(ctx context.Context, key string) error {
@@ -125,6 +149,20 @@ func (s3 *S3) putLockFile(ctx context.Context, key string) error {
 
 func (s3 *S3) Unlock(ctx context.Context, key string) error {
 	s3.Logger.Info(fmt.Sprintf("Release lock: %v", s3.objName(key)))
+
+	// Prüfe ob die Lock-Datei existiert und gültig ist
+	data, err := s3.getLockFile(ctx, key)
+	if err != nil {
+		return fmt.Errorf("lock file does not exist")
+	}
+
+	// Validiere den Lock-Datei-Inhalt
+	_, err = time.Parse(time.RFC3339, data)
+	if err != nil {
+		return fmt.Errorf("invalid lock file content")
+	}
+
+	// Lösche die Lock-Datei
 	return s3.Client.RemoveObject(ctx, s3.Bucket, s3.objLockName(key), minio.RemoveObjectOptions{})
 }
 
@@ -135,7 +173,7 @@ func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
 		s3.Bucket,
 		s3.objName(key),
 		r,
-		int64(r.Len()),
+		r.Len(),
 		minio.PutObjectOptions{},
 	)
 	return err

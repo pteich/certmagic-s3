@@ -44,8 +44,8 @@ func TestIOWrap(t *testing.T) {
 	wr := sb.WrapReader(empty)
 
 	buf, err := io.ReadAll(wr)
-	if err != nil {
-		t.Errorf("reading failed: %s", err)
+	if err == nil {
+		t.Fatal("expected error, got nil")
 	}
 	if len(buf) != 0 {
 		t.Errorf("Buffer should be empty, got: %v", buf)
